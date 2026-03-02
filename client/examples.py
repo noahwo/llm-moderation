@@ -1,12 +1,12 @@
 # client/examples.py
 from __future__ import annotations
-
-from client.client import LGClient
+from client import LGClient
 
 def main() -> None:
+
     # If you tunnel port 18082 to localhost, use:
     # base_url = "http://127.0.0.1:18082"
-    base_url = "http://<NODE_IP>:18082"
+    base_url = "http://10.251.68.79:18082"
 
     cli = LGClient(base_url)
     print("healthz:", cli.healthz())

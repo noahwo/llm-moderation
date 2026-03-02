@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 from typing import Any, Dict, List, Optional
+import traceback
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -37,7 +38,31 @@ class ModerateResponse(BaseModel):
 # -----------------------
 # App + global runner
 # -----------------------
-MODEL_ID = os.environ.get("LG4_MODEL_ID", "meta-llama/Llama-Guard-4-12B")
+def _default_model_path() -> str:
+    """Pick a local cache if present; otherwise fall back to repo id."""
+
+    hf_home = os.environ.get("HF_HOME")
+    hf_cache = os.environ.get("TRANSFORMERS_CACHE")
+    custom_cache = os.environ.get("LG4_MODEL_CACHE")
+
+    candidates = [
+        os.environ.get("LG4_LOCAL_MODEL_PATH"),
+        os.environ.get("LG4_MODEL_PATH"),
+        os.path.join(custom_cache, "models--meta-llama--Llama-Guard-4-12B") if custom_cache else None,
+        os.path.join(hf_cache, "models--meta-llama--Llama-Guard-4-12B") if hf_cache else None,
+        os.path.join(hf_home, "hub", "models--meta-llama--Llama-Guard-4-12B") if hf_home else None,
+        "/home/wuguangh/.cache/huggingface/hub/models--meta-llama--Llama-Guard-4-12B",
+    ]
+
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+
+    return "meta-llama/Llama-Guard-4-12B"
+
+
+# Default to a local cache path if available to avoid fetching from HF at runtime.
+MODEL_ID = os.environ.get("LG4_MODEL_ID", _default_model_path())
 TORCH_DTYPE = os.environ.get("LG4_TORCH_DTYPE", "bfloat16")
 DEVICE_MAP = os.environ.get("LG4_DEVICE_MAP", "auto")
 
@@ -45,6 +70,7 @@ DEVICE_MAP = os.environ.get("LG4_DEVICE_MAP", "auto")
 MAX_CONCURRENT = int(os.environ.get("LG4_MAX_CONCURRENT", "1"))
 _sema = asyncio.Semaphore(MAX_CONCURRENT)
 
+# FastAPI app instance
 app = FastAPI(title="LlamaGuard4 Moderation Service", version="1.0.0")
 
 _runner: Optional[ModelRunner] = None
@@ -83,6 +109,7 @@ async def moderate(req: ModerateRequest) -> ModerateResponse:
             )
         except Exception as e:
             # Bubble up a readable error for debugging
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"moderation_failed: {type(e).__name__}: {e}")
 
     return ModerateResponse(

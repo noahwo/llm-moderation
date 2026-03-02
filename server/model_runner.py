@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -50,6 +52,26 @@ def _parse_llamaguard_text(text: str) -> Tuple[str, List[str]]:
     return verdict, cats
 
 
+def _resolve_model_path(model_id: str) -> Tuple[str, bool]:
+    """
+    If model_id points to a local HF cache directory (e.g. models--.../snapshots/<hash>),
+    pick the latest snapshot so we can load without hitting the network. Returns the
+    resolved path and whether it is local.
+    """
+
+    maybe_path = Path(model_id)
+    if not maybe_path.exists():
+        return model_id, False
+
+    snapshots_root = maybe_path / "snapshots"
+    if snapshots_root.is_dir():
+        snapshots = sorted(snapshots_root.iterdir(), reverse=True)
+        if snapshots:
+            return str(snapshots[0]), True
+
+    return str(maybe_path), True
+
+
 class ModelRunner:
     """
     Loads Llama Guard 4 once and provides a 'moderate' function.
@@ -61,7 +83,8 @@ class ModelRunner:
         torch_dtype: str = "bfloat16",
         device_map: str = "auto",
     ) -> None:
-        self.model_id = model_id
+        self.model_ref = model_id  # keep original identifier for reporting
+        self.model_path, is_local = _resolve_model_path(model_id)
 
         dtype = {
             "bfloat16": torch.bfloat16,
@@ -71,16 +94,42 @@ class ModelRunner:
         if dtype is None:
             raise ValueError(f"Unsupported torch_dtype={torch_dtype}")
 
+        load_kwargs = {"local_files_only": is_local}
+
         # Processor handles chat template + multimodal formatting
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.processor = AutoProcessor.from_pretrained(self.model_path, **load_kwargs)
 
         # Model load (on GPU via device_map="auto" typically)
         self.model = Llama4ForConditionalGeneration.from_pretrained(
-            model_id,
+            self.model_path,
             torch_dtype=dtype,
             device_map=device_map,
+            **load_kwargs,
         )
         self.model.eval()
+
+        # Some cached configs miss attention_chunk_size; set a safe default to avoid mask errors.
+        # We need to propagate the value to *all* sub-module configs because
+        # create_chunked_causal_mask() reads from the inner Llama4TextModel.config,
+        # not from the top-level Llama4ForConditionalGeneration.config.
+        chunk_size = getattr(self.model.config, "attention_chunk_size", None)
+        if chunk_size is None:
+            chunk_size = (
+                getattr(self.model.config, "sliding_window", None)
+                or getattr(self.model.config, "max_position_embeddings", None)
+                or 4096
+            )
+        # Always set on the top-level config and on text_config (Llama4Config wrapper)
+        self.model.config.attention_chunk_size = chunk_size
+        text_cfg = getattr(self.model.config, "text_config", None)
+        if text_cfg is not None and getattr(text_cfg, "attention_chunk_size", None) is None:
+            text_cfg.attention_chunk_size = chunk_size
+        # Propagate to every sub-module that carries its own config object
+        for module in self.model.modules():
+            sub_cfg = getattr(module, "config", None)
+            if sub_cfg is not None and sub_cfg is not self.model.config:
+                if getattr(sub_cfg, "attention_chunk_size", None) is None:
+                    sub_cfg.attention_chunk_size = chunk_size
 
         # A quick attribute for later
         self._dtype = dtype
@@ -99,15 +148,22 @@ class ModelRunner:
         excluded_category_keys = excluded_category_keys or []
 
         # Apply template -> tokenized tensors
-        # Note: processor.apply_chat_template supports excluded_category_keys in the blog.
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-            excluded_category_keys=excluded_category_keys,
-        )
+        # Some processor versions take positional `conversation` and may not accept excluded_category_keys.
+        apply_kwargs: Dict[str, Any] = {
+            "tokenize": True,
+            "add_generation_prompt": True,
+            "return_tensors": "pt",
+            "return_dict": True,
+        }
+        if "excluded_category_keys" in inspect.signature(self.processor.apply_chat_template).parameters:
+            apply_kwargs["excluded_category_keys"] = excluded_category_keys
+
+        try:
+            inputs = self.processor.apply_chat_template(messages, **apply_kwargs)
+        except TypeError:
+            # Fallback for older signature; drop excluded_category_keys if unsupported
+            apply_kwargs.pop("excluded_category_keys", None)
+            inputs = self.processor.apply_chat_template(messages, **apply_kwargs)
 
         # Move inputs to the same device as the model (device_map may shard,
         # but input tensors should go to the first parameter's device).
@@ -123,6 +179,7 @@ class ModelRunner:
                 **inputs,
                 max_new_tokens=int(max_new_tokens),
                 do_sample=bool(do_sample),
+                use_cache=False,  # avoid StaticCache path that fails when sliding_window is None in this checkpoint
             )
 
         prompt_len = inputs["input_ids"].shape[-1]
@@ -134,5 +191,5 @@ class ModelRunner:
             verdict=verdict,
             categories=categories,
             raw=decoded.strip(),
-            model=self.model_id,
+            model=self.model_ref,
         )

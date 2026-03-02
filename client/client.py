@@ -40,7 +40,7 @@ class LGClient:
                     "content": [{"type": "text", "text": text}],
                 }
             ],
-            "excluded_category_keys": excluded_category_keys,
+            # "excluded_category_keys": excluded_category_keys,
             "max_new_tokens": max_new_tokens,
             "do_sample": do_sample,
         }

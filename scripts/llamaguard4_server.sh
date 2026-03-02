@@ -1,27 +1,22 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=lg4-serve
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=6
-#SBATCH --mem=32G
-#SBATCH --time=06:00:00
-#SBATCH --output=logs/lg4-%j.out
-#SBATCH --error=logs/lg4-%j.err
 
 set -euo pipefail
 
 # --- Customize these for your environment ---
-CONDA_ENV_PATH="/wrk-vakka/users/wuguangh/conda-envs/llm-mod"
+# CONDA_ENV_PATH="/wrk-vakka/users/wuguangh/conda-envs/llm-mod"
 PORT="18082"
 HOST="0.0.0.0"
+NODE_IP="$(hostname -I | awk '{print $1}')"
 
 # Optional: put HF caches somewhere fast/persistent for the cluster
-export HF_HOME="${HF_HOME:-/wrk-vakka/users/$USER/hf-home}"
+# export HF_HOME="${HF_HOME:-/wrk-vakka/users/$USER/hf-home}"
+export HF_HOME="${HF_HOME:-/home/wuguangh/.cache/huggingface}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 
 # Optional knobs for the service
-export LG4_MODEL_ID="meta-llama/Llama-Guard-4-12B"
+export LG4_MODEL_ID="/home/wuguangh/.cache/huggingface/hub/models--meta-llama--Llama-Guard-4-12B"
 export LG4_TORCH_DTYPE="bfloat16"
 export LG4_DEVICE_MAP="auto"
 export LG4_MAX_CONCURRENT="1"
@@ -36,10 +31,14 @@ echo "TRANSFORMERS_CACHE=$TRANSFORMERS_CACHE"
 echo "================"
 
 # Activate conda env
-source "$(dirname "$CONDA_ENV_PATH")/bin/activate" "$CONDA_ENV_PATH"
+# source "$(dirname "$CONDA_ENV_PATH")/bin/activate" "$CONDA_ENV_PATH"
+source ~/.bashrc.bak
+conda activate moderation
 
-python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'available', torch.cuda.is_available())"
-python -c "import transformers; print('transformers', transformers.__version__)"
+
+python -c "import torch; print('torch:', torch.__version__, '  cuda:', torch.version.cuda, '  available:', torch.cuda.is_available())"
+
+python -c "import transformers; print('transformers:', transformers.__version__)"
 
 # Run from your repo root (adjust if needed)
 # Expecting:
@@ -49,10 +48,11 @@ python -c "import transformers; print('transformers', transformers.__version__)"
 # If your sbatch is run from elsewhere, uncomment and set:
 # cd /path/to/moderation_service
 
-echo "Starting LG4 server on ${HOST}:${PORT}"
+echo "Starting LG4 server on ${NODE_IP}:${PORT}"
 echo "TIP: If calling from login node, you can SSH tunnel:"
 echo "  ssh -N -L ${PORT}:$(hostname):${PORT} <login-host>"
-echo "Then call http://127.0.0.1:${PORT}/moderate"
+echo "Then call http://${NODE_IP}:${PORT}/moderate"
 
 # Start server
-python -m uvicorn server.app:app --host "$HOST" --port "$PORT"
+# Log to file + stdout
+exec python -m uvicorn server.app:app --host "$HOST" --port "$PORT" 2>&1 | tee "logs/lg4_${SLURM_JOB_ID:-manual}.log"
