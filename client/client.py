@@ -15,6 +15,13 @@ class ModerationResponse:
     model: str
 
 
+@dataclass(frozen=True)
+class T5ModerationResponse:
+    verdict: str   # "toxic" | "non-toxic" | "unknown"
+    raw: str       # "positive" | "negative" | ...
+    model: str
+
+
 class LGClient:
     def __init__(self, base_url: str, timeout_s: float = 120.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -54,6 +61,42 @@ class LGClient:
         return ModerationResponse(
             verdict=j.get("verdict", "unknown"),
             categories=j.get("categories", []) or [],
+            raw=j.get("raw", "") or "",
+            model=j.get("model", "") or "",
+        )
+
+
+class T5Client:
+    """HTTP client for the ToxicChat-T5 moderation server (server/t5_app.py)."""
+
+    def __init__(self, base_url: str, timeout_s: float = 60.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout_s = timeout_s
+
+    def healthz(self) -> Dict[str, Any]:
+        r = requests.get(f"{self.base_url}/healthz", timeout=self.timeout_s)
+        r.raise_for_status()
+        return r.json()
+
+    def moderate(
+        self,
+        text: str,
+        *,
+        max_new_tokens: int = 10,
+    ) -> T5ModerationResponse:
+        payload: Dict[str, Any] = {
+            "text": text,
+            "max_new_tokens": max_new_tokens,
+        }
+        r = requests.post(
+            f"{self.base_url}/moderate",
+            json=payload,
+            timeout=self.timeout_s,
+        )
+        r.raise_for_status()
+        j = r.json()
+        return T5ModerationResponse(
+            verdict=j.get("verdict", "unknown"),
             raw=j.get("raw", "") or "",
             model=j.get("model", "") or "",
         )

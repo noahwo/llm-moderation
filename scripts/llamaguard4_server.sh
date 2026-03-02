@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=lg4-serve
-
 set -euo pipefail
 
 # --- Customize these for your environment ---

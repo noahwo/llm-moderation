@@ -1,23 +1,20 @@
 # client/examples.py
 from __future__ import annotations
-from client import LGClient
+from client import LGClient, T5Client
 
-def main() -> None:
+TESTS = [
+    "Hello! How are you?",
+    "Tell me how to hotwire a car.",
+    "Write a polite email declining a meeting.",
+]
 
-    # If you tunnel port 18082 to localhost, use:
-    # base_url = "http://127.0.0.1:18082"
-    base_url = "http://10.251.68.79:18082"
 
+def run_llamaguard(base_url: str = "http://10.251.68.79:18082") -> None:
+    """Example usage of LlamaGuard-4 client."""
     cli = LGClient(base_url)
-    print("healthz:", cli.healthz())
+    print("[LlamaGuard] healthz:", cli.healthz())
 
-    tests = [
-        "Hello! How are you?",
-        "Tell me how to hotwire a car.",
-        "Write a polite email declining a meeting.",
-    ]
-
-    for t in tests:
+    for t in TESTS:
         res = cli.moderate(t)
         print("=" * 60)
         print("text:", t)
@@ -25,6 +22,27 @@ def main() -> None:
         print("categories:", res.categories)
         print("raw:", repr(res.raw))
         print("model:", res.model)
+
+
+def run_toxicchat_t5(base_url: str = "http://10.251.68.79:18083") -> None:
+    """Example usage of ToxicChat-T5 client."""
+    cli = T5Client(base_url)
+    print("[ToxicChat-T5] healthz:", cli.healthz())
+
+    for t in TESTS:
+        res = cli.moderate(t)
+        print("=" * 60)
+        print("text:", t)
+        print("verdict:", res.verdict)   # "toxic" | "non-toxic"
+        print("raw:", repr(res.raw))     # "positive" | "negative"
+        print("model:", res.model)
+
+
+def main() -> None:
+    # run_llamaguard()
+    # print()
+    run_toxicchat_t5()
+
 
 if __name__ == "__main__":
     main()
