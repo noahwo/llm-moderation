@@ -5,3 +5,5 @@ requests>=2.31
 transformers>=4.50.0
 torch
 accelerate
+openai>=1.0
+python-dotenv>=1.0

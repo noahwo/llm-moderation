@@ -285,6 +285,21 @@ class LG4ModelRunner:
         # Text-only messages are returned unchanged; no pixel_values are produced.
         messages = _load_images(messages)
 
+        # LlamaGuard-4's Jinja chat template inserts <|image|> placeholder tokens
+        # only when a text block is also present in the same message.  If images
+        # are submitted without any accompanying text (pure-image moderation), the
+        # template produces 0 placeholders while the processor still extracts the
+        # PIL images, causing a count-mismatch ValueError.  Guard against this by
+        # ensuring every message that carries image blocks also has a text block
+        # (empty string is sufficient — it just anchors the image tokens).
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                has_img = any(b.get("type") == "image" for b in content)
+                has_txt = any(b.get("type") == "text" for b in content)
+                if has_img and not has_txt:
+                    content.append({"type": "text", "text": ""})
+
         # Single-call pattern per the Llama Guard 4 model card.
         # apply_chat_template(tokenize=True, return_dict=True) renders the chat
         # template, tokenizes, and injects pixel_values — but ONLY when image

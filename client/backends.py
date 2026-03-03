@@ -1,4 +1,4 @@
-# client/client.py
+# client/backends.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -92,7 +92,7 @@ class LGClient:
 
     def moderate_multimodal(
         self,
-        text: str,
+        text: str = "",
         images: Optional[List[Any]] = None,
         *,
         excluded_category_keys: Optional[List[str]] = None,
@@ -108,7 +108,8 @@ class LGClient:
         content: List[Dict[str, Any]] = []
         for img in (images or []):
             content.append(self._image_block(img))
-        content.append({"type": "text", "text": text})
+        if text:
+            content.append({"type": "text", "text": text})
 
         payload: Dict[str, Any] = {
             "messages": [{"role": "user", "content": content}],
