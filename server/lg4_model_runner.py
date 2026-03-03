@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import inspect
+import io
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,20 +27,31 @@ class LG4ModerationResult:
     model: str
 
 
-def _normalize_image_blocks(
+def _load_images(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    Normalize image content blocks so that transformers' apply_chat_template can
-    extract them natively (it looks for keys 'image', 'url', 'path', 'base64').
+    Eagerly resolve every image content block to a PIL.Image and store it under
+    the ``"image"`` key.  ``apply_chat_template`` extracts values from content
+    blocks using the key list ``["image", "url", "path", "base64"]``; by putting
+    a real PIL object under ``"image"`` we bypass any network/FS access inside
+    the processor and handle all source formats uniformly here.
 
-    Accepted input formats (from the JSON payload):
-      {"type": "image", "url": "https://..."}            – kept as-is (HTTP URL)
-      {"type": "image", "url": "data:image/...;base64,…"} – data URI  → base64 key
-      {"type": "image", "data": "<base64>",
-       "media_type": "image/jpeg"}                       – Anthropic style → base64 key
+    Accepted block formats (from the JSON payload):
+      {"type": "image", "url": "https://..."}                     – HTTP/S URL
+      {"type": "image", "url": "data:image/jpeg;base64,<b64>"}    – data URI
+      {"type": "image", "data": "<b64>", "media_type": "..."}     – Anthropic style
+      {"type": "image", "path": "/local/file.jpg"}                – local file path
     """
-    normalized: List[Dict[str, Any]] = []
+    try:
+        from PIL import Image
+        import requests as _req
+    except ImportError as exc:
+        raise RuntimeError(
+            "Pillow and requests are required for image moderation"
+        ) from exc
+
+    result: List[Dict[str, Any]] = []
     for msg in messages:
         new_content: List[Dict[str, Any]] = []
         for block in msg.get("content", []):
@@ -46,24 +59,40 @@ def _normalize_image_blocks(
                 new_content.append(block)
                 continue
 
-            if "data" in block:
-                # Anthropic-style: {"type":"image", "data":"<b64>", "media_type":"..."}
-                new_content.append({"type": "image", "base64": block["data"]})
+            if "path" in block:
+                # Local file path
+                img = Image.open(block["path"]).convert("RGB")
+
+            elif "data" in block:
+                # Anthropic-style base64: {"data": "<b64>", "media_type": "..."}
+                img = Image.open(io.BytesIO(base64.b64decode(block["data"]))).convert("RGB")
+
             elif "url" in block:
                 url = block["url"]
                 if url.startswith("data:"):
                     # Data URI: data:image/jpeg;base64,<b64data>
                     _, b64 = url.split(",", 1)
-                    new_content.append({"type": "image", "base64": b64})
+                    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
                 else:
-                    # Plain HTTP/S URL — processor fetches it
-                    new_content.append({"type": "image", "url": url})
+                    # HTTP/S URL — fetch here so the processor never needs to
+                    resp = _req.get(
+                        url,
+                        timeout=30,
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; llm-moderation/1.0)"},
+                    )
+                    resp.raise_for_status()
+                    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+
             else:
-                raise ValueError(f"Image block missing 'data' or 'url': {block}")
+                raise ValueError(f"Image block missing 'url', 'data', or 'path': {block}")
 
-        normalized.append({**msg, "content": new_content})
+            # Store under the "image" key — apply_chat_template extracts this
+            # into batch_images which the processor's fetch_images handles natively.
+            new_content.append({"type": "image", "image": img})
 
-    return normalized
+        result.append({**msg, "content": new_content})
+
+    return result
 
 
 def _parse_llamaguard_text(text: str) -> Tuple[str, List[str]]:
@@ -241,17 +270,20 @@ class LG4ModelRunner:
         [{"role":"user","content":[{"type":"text","text":"..."}]}]
 
         Image blocks are supported inside content:
-          {"type": "image", "url": "https://..."}          – public URL
-          {"type": "image", "data": "<base64>",
-           "media_type": "image/jpeg"}                     – base64-encoded
+          {"type": "image", "url": "https://..."}                  – HTTP/S URL
+          {"type": "image", "url": "data:image/jpeg;base64,<b64>"} – data URI
+          {"type": "image", "data": "<b64>", "media_type": "..."}  – Anthropic base64
+          {"type": "image", "path": "/local/file.jpg"}             – local file
         """
         excluded_category_keys = excluded_category_keys or []
 
-        # Normalize image content blocks to formats the processor understands
-        # ('url', 'base64', 'path', or 'image' keys).  The processor's
-        # apply_chat_template extracts images from message content internally —
-        # we must NOT pass images= as a separate kwarg or it will conflict.
-        messages = _normalize_image_blocks(messages)
+        # Pre-load all image blocks (URL / data-URI / base64 / local path) into
+        # PIL images stored under the "image" key.  apply_chat_template extracts
+        # content-block values using keys ["image","url","path","base64"], so a
+        # real PIL object under "image" is handled natively by fetch_images
+        # without relying on the processor to do any network/FS access itself.
+        # Text-only messages are returned unchanged; no pixel_values are produced.
+        messages = _load_images(messages)
 
         # Single-call pattern per the Llama Guard 4 model card.
         # apply_chat_template(tokenize=True, return_dict=True) renders the chat

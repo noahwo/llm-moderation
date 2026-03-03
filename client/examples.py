@@ -50,7 +50,10 @@ def run_llamaguard(node_ip: str = NODE_IP, ) -> None:
     """Standalone LlamaGuard-4 server."""
     base_url: str = f"http://{node_ip}:18084/lg4"
     cli = LGClient(base_url)
-    print("[LlamaGuard] healthz:", cli.healthz())
+    
+    print("[bold cyan][LlamaGuard4] healthz[/bold cyan]")
+    print(Pretty(cli.healthz(), expand_all=True))
+    # print("[LlamaGuard4] healthz:", cli.healthz())
     for t in TESTS:
         res = cli.moderate(t)
         print("=" * 60)
@@ -65,7 +68,12 @@ def run_toxicchat_t5(node_ip: str = NODE_IP, ) -> None:
     """Standalone ToxicChat-T5 server."""
     base_url: str = f"http://{node_ip}:18084/t5"
     cli = T5Client(base_url)
-    print("[ToxicChat-T5] healthz:", cli.healthz())
+    
+    print("[bold cyan][ToxicChat-T5] healthz[/bold cyan]")
+    print(Pretty(cli.healthz(), expand_all=True))
+    # print("[ToxicChat-T5] healthz:", cli.healthz())
+ 
+    
     for t in TESTS:
         res = cli.moderate(t)
         print("=" * 60)
@@ -98,7 +106,7 @@ def run_combined(node_ip: str = NODE_IP,
 def run_image_moderation(
     node_ip: str = NODE_IP,
     
-    image_source: str = "/home/wuguangh/Projects/llm-moderation/image1.png",
+    image_source: str = "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b6/Image_created_with_a_mobile_phone.png/1920px-Image_created_with_a_mobile_phone.png",
 ) -> None:
     """
     Demonstrate image moderation with LlamaGuard-4.
@@ -110,7 +118,9 @@ def run_image_moderation(
     """
     base_url: str = f"http://{node_ip}:18084/lg4"
     cli = LGClient(base_url)
-    print("[LG4 image] healthz:", cli.healthz())
+    
+    print("[bold cyan][LG4 image] healthz[/bold cyan]")
+    print(Pretty(cli.healthz(), expand_all=True))
 
     # Text + image together
     res = cli.moderate_multimodal(
@@ -128,7 +138,11 @@ def main() -> None:
 
     run_combined(node_ip=NODE_IP)
     print()
-    run_image_moderation(node_ip=NODE_IP)
+    image_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b6/Image_created_with_a_mobile_phone.png/1920px-Image_created_with_a_mobile_phone.png"
+    run_image_moderation(node_ip=NODE_IP, image_source=image_url)
+    
+    image_path = "/home/wuguangh/Projects/llm-moderation/image1.png"
+    run_image_moderation(node_ip=NODE_IP, image_source=image_path)
 
 
 if __name__ == "__main__":
