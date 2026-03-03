@@ -1,1 +1,8 @@
 .env
+__pycache__/
+*.pyc
+*.pyo
+logs/
+datasets/UnsafeBench/
+datasets/samples/
+.vscode/

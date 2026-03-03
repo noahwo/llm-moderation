@@ -1,19 +1,24 @@
-# server/combined_app.py
+# server/app.py
 """
-Combined moderation service: LlamaGuard-4 + ToxicChat-T5 in a single process.
+LLM Moderation Service — FastAPI application.
 
 Routes:
   GET  /healthz          – overall health (both models)
   GET  /lg4/healthz      – LlamaGuard-4 health
-  POST /lg4/moderate     – LlamaGuard-4 moderation
+  POST /lg4/moderate     – LlamaGuard-4 moderation (text + optional images)
   GET  /t5/healthz       – ToxicChat-T5 health
-  POST /t5/moderate      – ToxicChat-T5 moderation
+  POST /t5/moderate      – ToxicChat-T5 moderation (text only)
+
+Configure via environment variables (see server/__main__.py for defaults):
+  LG4_MODEL_ID, LG4_TORCH_DTYPE, LG4_DEVICE_MAP, LG4_MAX_CONCURRENT
+  T5_MODEL_ID,  T5_TORCH_DTYPE,  T5_DEVICE_MAP,  T5_MAX_CONCURRENT
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
-import traceback
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException
@@ -22,14 +27,19 @@ from pydantic import BaseModel, Field
 from server.lg4_model_runner import LG4ModelRunner
 from server.t5_model_runner import T5ModelRunner
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
-# Shared request/response schemas (reuse from existing apps)
+# Request / response schemas
 # ---------------------------------------------------------------------------
 class LG4ModerateRequest(BaseModel):
     messages: List[Dict[str, Any]] = Field(
         ...,
-        description="HF chat message list; content supports multimodal blocks.",
+        description=(
+            "HF chat message list. Content blocks support text and images: "
+            "{type:text, text:...} or {type:image, url:...} / {type:image, data:<b64>}"
+        ),
     )
     excluded_category_keys: Optional[List[str]] = Field(default=None)
     max_new_tokens: int = Field(default=10, ge=1, le=256)
@@ -37,8 +47,8 @@ class LG4ModerateRequest(BaseModel):
 
 
 class LG4ModerateResponse(BaseModel):
-    verdict: str
-    categories: List[str]
+    verdict: str          # "safe" | "unsafe" | "unknown"
+    categories: List[str] # e.g. ["S9"]
     raw: str
     model: str
 
@@ -49,8 +59,8 @@ class T5ModerateRequest(BaseModel):
 
 
 class T5ModerateResponse(BaseModel):
-    verdict: str
-    raw: str
+    verdict: str  # "toxic" | "non-toxic" | "unknown"
+    raw: str      # "positive" | "negative"
     model: str
 
 
@@ -58,8 +68,6 @@ class T5ModerateResponse(BaseModel):
 # Config from environment
 # ---------------------------------------------------------------------------
 def _default_lg4_model() -> str:
-    import os
-    from pathlib import Path
     hf_home = os.environ.get("HF_HOME")
     hf_cache = os.environ.get("TRANSFORMERS_CACHE")
     candidates = [
@@ -77,28 +85,27 @@ def _default_lg4_model() -> str:
 
 LG4_MODEL_ID   = os.environ.get("LG4_MODEL_ID", _default_lg4_model())
 LG4_DTYPE      = os.environ.get("LG4_TORCH_DTYPE", "bfloat16")
-LG4_DEVICE_MAP = os.environ.get("LG4_DEVICE_MAP", "auto")
+LG4_DEVICE_MAP = os.environ.get("LG4_DEVICE_MAP", "cuda")
 LG4_MAX_CONC   = int(os.environ.get("LG4_MAX_CONCURRENT", "1"))
 
 T5_MODEL_ID    = os.environ.get("T5_MODEL_ID", "lmsys/toxicchat-t5-large-v1.0")
 T5_DTYPE       = os.environ.get("T5_TORCH_DTYPE", "float32")
-T5_DEVICE_MAP  = os.environ.get("T5_DEVICE_MAP", "auto")
+T5_DEVICE_MAP  = os.environ.get("T5_DEVICE_MAP", "cuda")
 T5_MAX_CONC    = int(os.environ.get("T5_MAX_CONCURRENT", "2"))
 
-# Semaphores
 _lg4_sema = asyncio.Semaphore(LG4_MAX_CONC)
 _t5_sema  = asyncio.Semaphore(T5_MAX_CONC)
 
 # ---------------------------------------------------------------------------
-# Global runners
+# Global model runners (populated at startup)
 # ---------------------------------------------------------------------------
-_lg4_runner: Optional[LG4ModelRunner]   = None
-_t5_runner:  Optional[T5ModelRunner] = None
+_lg4_runner: Optional[LG4ModelRunner] = None
+_t5_runner:  Optional[T5ModelRunner]  = None
 
 # ---------------------------------------------------------------------------
-# FastAPI app + routers
+# FastAPI application
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Combined Moderation Service (LG4 + ToxicChat-T5)", version="1.0.0")
+app = FastAPI(title="LLM Moderation Service", version="1.0.0")
 
 lg4_router = APIRouter(prefix="/lg4", tags=["LlamaGuard-4"])
 t5_router  = APIRouter(prefix="/t5",  tags=["ToxicChat-T5"])
@@ -107,19 +114,21 @@ t5_router  = APIRouter(prefix="/t5",  tags=["ToxicChat-T5"])
 @app.on_event("startup")
 def _startup() -> None:
     global _lg4_runner, _t5_runner
-    print("[combined] Loading LlamaGuard-4 ...", flush=True)
+    node_ip = os.environ.get("NODE_IP", "unknown")
+    logger.info("Node IP: %s", node_ip)
+    logger.info("Loading LlamaGuard-4 (model=%s) ...", LG4_MODEL_ID)
     _lg4_runner = LG4ModelRunner(
         model_id=LG4_MODEL_ID,
         torch_dtype=LG4_DTYPE,
         device_map=LG4_DEVICE_MAP,
     )
-    print("[combined] Loading ToxicChat-T5 ...", flush=True)
+    logger.info("Loading ToxicChat-T5 (model=%s) ...", T5_MODEL_ID)
     _t5_runner = T5ModelRunner(
         model_id=T5_MODEL_ID,
         torch_dtype=T5_DTYPE,
         device_map=T5_DEVICE_MAP,
     )
-    print("[combined] Both models ready.", flush=True)
+    logger.info("Both models ready.")
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +166,9 @@ async def lg4_moderate(req: LG4ModerateRequest) -> LG4ModerateResponse:
                 do_sample=req.do_sample,
             )
         except Exception as e:
-            traceback.print_exc()
+            logger.exception("LG4 moderation failed")
             raise HTTPException(status_code=500, detail=f"lg4_failed: {type(e).__name__}: {e}")
+    logger.debug("LG4 result: verdict=%s categories=%s", res.verdict, res.categories)
     return LG4ModerateResponse(
         verdict=res.verdict, categories=res.categories, raw=res.raw, model=res.model
     )
@@ -182,8 +192,9 @@ async def t5_moderate(req: T5ModerateRequest) -> T5ModerateResponse:
         try:
             res = _t5_runner.moderate(text=req.text, max_new_tokens=req.max_new_tokens)
         except Exception as e:
-            traceback.print_exc()
+            logger.exception("T5 moderation failed")
             raise HTTPException(status_code=500, detail=f"t5_failed: {type(e).__name__}: {e}")
+    logger.debug("T5 result: verdict=%s raw=%s", res.verdict, res.raw)
     return T5ModerateResponse(verdict=res.verdict, raw=res.raw, model=res.model)
 
 

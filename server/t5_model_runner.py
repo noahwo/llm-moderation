@@ -5,15 +5,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
 
+import logging
 import os
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+logger = logging.getLogger(__name__)
+
 # T5 encoder-decoder models do not work correctly with device_map="auto"
 # (cross-attention breaks when encoder/decoder land on different devices).
-# Always load onto a single device, exactly as the model card shows.
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Always load onto a single CUDA device, exactly as the model card shows.
+_DEVICE = "cuda"
 
 
 def _hf_token() -> str | None:
@@ -109,7 +112,7 @@ class T5ModelRunner:
         self,
         model_id: str = "lmsys/toxicchat-t5-large-v1.0",
         torch_dtype: str = "float32",  # model weights are native F32; keep as-is
-        device_map: str = "auto",      # ignored for T5; single-device .to() is used
+        device_map: str = "cuda",      # ignored for T5; single-device .to("cuda") is used
     ) -> None:
         self.model_ref = model_id
         self.model_path, is_local = _resolve_model_path(model_id)
@@ -149,7 +152,7 @@ class T5ModelRunner:
         if hasattr(self.model, "generation_config") and self.model.generation_config is not None:
             self.model.generation_config.decoder_start_token_id = pad_id
             self.model.generation_config.forced_bos_token_id = None
-        print(f"[T5] decoder_start_token_id: {orig} -> {pad_id}  (device: {self._device})", flush=True)
+        logger.info("T5 decoder_start_token_id reset: %s -> %s  (device: %s)", orig, pad_id, self._device)
 
     def moderate(self, text: str, max_new_tokens: int = 10) -> T5ModerationResult:
         """

@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import base64
 import inspect
-import io
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoProcessor, Llama4ForConditionalGeneration
+try:
+    from transformers.models.llama4.modeling_llama4 import Llama4VisionRotaryEmbedding as _Llama4VisionRotaryEmbedding
+except ImportError:
+    _Llama4VisionRotaryEmbedding = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -20,30 +25,20 @@ class LG4ModerationResult:
     model: str
 
 
-def _extract_images(
+def _normalize_image_blocks(
     messages: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Any]]:
+) -> List[Dict[str, Any]]:
     """
-    Walk the message list and pull out image content blocks.
+    Normalize image content blocks so that transformers' apply_chat_template can
+    extract them natively (it looks for keys 'image', 'url', 'path', 'base64').
 
-    Accepted block formats (in the JSON payload):
-      {"type": "image", "url": "https://..."}           – public URL
+    Accepted input formats (from the JSON payload):
+      {"type": "image", "url": "https://..."}            – kept as-is (HTTP URL)
+      {"type": "image", "url": "data:image/...;base64,…"} – data URI  → base64 key
       {"type": "image", "data": "<base64>",
-       "media_type": "image/jpeg"}                      – base64-encoded bytes
-
-    Each image block is replaced with the bare {"type": "image"} sentinel
-    that Llama 4's processor expects, and the decoded PIL.Image is appended
-    to the returned images list (in document order).
+       "media_type": "image/jpeg"}                       – Anthropic style → base64 key
     """
-    try:
-        from PIL import Image
-        import requests as _req
-    except ImportError as e:
-        raise RuntimeError("Pillow and requests are required for image moderation") from e
-
-    cleaned: List[Dict[str, Any]] = []
-    images: List[Any] = []
-
+    normalized: List[Dict[str, Any]] = []
     for msg in messages:
         new_content: List[Dict[str, Any]] = []
         for block in msg.get("content", []):
@@ -51,35 +46,24 @@ def _extract_images(
                 new_content.append(block)
                 continue
 
-            # Resolve the image to a PIL Image object
             if "data" in block:
-                # base64-encoded bytes
-                raw = base64.b64decode(block["data"])
-                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                # Anthropic-style: {"type":"image", "data":"<b64>", "media_type":"..."}
+                new_content.append({"type": "image", "base64": block["data"]})
             elif "url" in block:
                 url = block["url"]
                 if url.startswith("data:"):
-                    # data URI: data:image/jpeg;base64,<data>
-                    header, b64 = url.split(",", 1)
-                    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+                    # Data URI: data:image/jpeg;base64,<b64data>
+                    _, b64 = url.split(",", 1)
+                    new_content.append({"type": "image", "base64": b64})
                 else:
-                    resp = _req.get(
-                        url,
-                        timeout=30,
-                        headers={"User-Agent": "Mozilla/5.0 (compatible; llm-moderation/1.0)"},
-                    )
-                    resp.raise_for_status()
-                    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                    # Plain HTTP/S URL — processor fetches it
+                    new_content.append({"type": "image", "url": url})
             else:
                 raise ValueError(f"Image block missing 'data' or 'url': {block}")
 
-            images.append(img)
-            # Replace with the bare sentinel the processor expects
-            new_content.append({"type": "image"})
+        normalized.append({**msg, "content": new_content})
 
-        cleaned.append({**msg, "content": new_content})
-
-    return cleaned, images
+    return normalized
 
 
 def _parse_llamaguard_text(text: str) -> Tuple[str, List[str]]:
@@ -145,7 +129,7 @@ class LG4ModelRunner:
         self,
         model_id: str = "meta-llama/Llama-Guard-4-12B",
         torch_dtype: str = "bfloat16",
-        device_map: str = "auto",
+        device_map: str = "cuda",
     ) -> None:
         self.model_ref = model_id  # keep original identifier for reporting
         self.model_path, is_local = _resolve_model_path(model_id)
@@ -163,7 +147,7 @@ class LG4ModelRunner:
         # Processor handles chat template + multimodal formatting
         self.processor = AutoProcessor.from_pretrained(self.model_path, **load_kwargs)
 
-        # Model load (on GPU via device_map="auto" typically)
+        # Model load onto CUDA explicitly
         self.model = Llama4ForConditionalGeneration.from_pretrained(
             self.model_path,
             torch_dtype=dtype,
@@ -171,6 +155,53 @@ class LG4ModelRunner:
             **load_kwargs,
         )
         self.model.eval()
+
+        # Fix meta-device tensors left after device_map loading.
+        #
+        # Llama4VisionRotaryEmbedding stores `freqs_ci` as a plain Python
+        # attribute (self.freqs_ci = ...), NOT via register_buffer().  Under
+        # init_empty_weights() / device_map loading accelerate only restores
+        # state_dict tensors; non-persistent plain attributes are never moved
+        # and stay as meta tensors forever.  The _buffers dict won't contain
+        # freqs_ci, so we must handle it separately by re-running __init__.
+        _model_device = torch.device("cuda")
+        if _Llama4VisionRotaryEmbedding is not None:
+            # Llama4VisionRotaryEmbedding.__init__ takes a Llama4VisionConfig but
+            # does NOT store it as self.config — so _mod.config doesn't exist.
+            # Retrieve it from the top-level model config instead.
+            _vision_cfg = (
+                getattr(self.model.config, "vision_config", None)
+                or getattr(self.model.config, "vision_model_config", None)
+            )
+            for _mod in self.model.modules():
+                if isinstance(_mod, _Llama4VisionRotaryEmbedding):
+                    fci = getattr(_mod, "freqs_ci", None)
+                    if fci is not None and isinstance(fci, torch.Tensor) and fci.device.type == "meta":
+                        if _vision_cfg is None:
+                            raise RuntimeError(
+                                "Cannot recompute freqs_ci: vision_config not found in model.config"
+                            )
+                        # Re-run __init__ outside init_empty_weights context so
+                        # freqs_ci is computed as real CPU tensors, then move to CUDA.
+                        _Llama4VisionRotaryEmbedding.__init__(_mod, _vision_cfg)
+                        _mod.freqs_ci = _mod.freqs_ci.to(_model_device)
+                        logger.info(
+                            "Recomputed Llama4VisionRotaryEmbedding.freqs_ci -> %s",
+                            _model_device,
+                        )
+
+        # Also sweep registered buffers in _buffers for any other meta tensors
+        # (belt-and-suspenders for future transformers changes).
+        for _mod in self.model.modules():
+            for _buf_name, _buf in list(_mod._buffers.items()):
+                if _buf is not None and _buf.device.type == "meta":
+                    _mod._buffers[_buf_name] = torch.zeros(
+                        _buf.shape, dtype=_buf.dtype, device=_model_device
+                    )
+                    logger.info(
+                        "Materialized meta buffer %s.%s -> %s",
+                        type(_mod).__name__, _buf_name, _model_device,
+                    )
 
         # Some cached configs miss attention_chunk_size; set a safe default to avoid mask errors.
         # We need to propagate the value to *all* sub-module configs because
@@ -216,40 +247,35 @@ class LG4ModelRunner:
         """
         excluded_category_keys = excluded_category_keys or []
 
-        # Decode image blocks and replace with bare {"type":"image"} sentinels
-        messages, images = _extract_images(messages)
+        # Normalize image content blocks to formats the processor understands
+        # ('url', 'base64', 'path', or 'image' keys).  The processor's
+        # apply_chat_template extracts images from message content internally —
+        # we must NOT pass images= as a separate kwarg or it will conflict.
+        messages = _normalize_image_blocks(messages)
 
-        # Step 1: render the chat template to a plain text string (no tokenization yet).
-        # apply_chat_template does NOT accept images= — images are passed to the
-        # processor call in step 2.
+        # Single-call pattern per the Llama Guard 4 model card.
+        # apply_chat_template(tokenize=True, return_dict=True) renders the chat
+        # template, tokenizes, and injects pixel_values — but ONLY when image
+        # blocks with resolvable content are present in messages.  Text-only
+        # requests produce no vision keys, so the vision encoder is never called.
         template_kwargs: Dict[str, Any] = {
-            "tokenize": False,
+            "tokenize": True,
             "add_generation_prompt": True,
+            "return_tensors": "pt",
+            "return_dict": True,
+            # Do NOT add images= here — processor extracts from message content.
         }
         if "excluded_category_keys" in inspect.signature(self.processor.apply_chat_template).parameters:
             template_kwargs["excluded_category_keys"] = excluded_category_keys
 
         try:
-            prompt_text: str = self.processor.apply_chat_template(messages, **template_kwargs)
+            inputs = self.processor.apply_chat_template(messages, **template_kwargs)
         except TypeError:
             template_kwargs.pop("excluded_category_keys", None)
-            prompt_text = self.processor.apply_chat_template(messages, **template_kwargs)
+            inputs = self.processor.apply_chat_template(messages, **template_kwargs)
 
-        # Step 2: tokenize — pass images here so the processor can insert pixel values.
-        proc_kwargs: Dict[str, Any] = {
-            "return_tensors": "pt",
-        }
-        if images:
-            proc_kwargs["images"] = images
-        inputs = self.processor(text=prompt_text, **proc_kwargs)
-
-        # Move inputs to the same device as the model (device_map may shard,
-        # but input tensors should go to the first parameter's device).
-        # This is a practical approach for device_map="auto".
-        model_device = next(self.model.parameters()).device
-        for k, v in inputs.items():
-            if torch.is_tensor(v):
-                inputs[k] = v.to(model_device)
+        # Move all tensors to CUDA.
+        inputs = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in inputs.items()}
 
         with torch.inference_mode():
             # Keep generation deterministic (do_sample=False) like the blog snippet
