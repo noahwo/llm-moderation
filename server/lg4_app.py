@@ -9,7 +9,7 @@ import traceback
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from server.model_runner import ModelRunner
+from server.lg4_model_runner import ModelRunner
 
 
 # -----------------------

@@ -53,4 +53,4 @@ echo "Then call http://${NODE_IP}:${PORT}/moderate"
 
 # Start server
 # Log to file + stdout
-exec python -m uvicorn server.app:app --host "$HOST" --port "$PORT" 2>&1 | tee "logs/lg4_${SLURM_JOB_ID:-manual}.log"
+exec python -m uvicorn server.lg4_app:app --host "$HOST" --port "$PORT" 2>&1 | tee >(grep -v "^Loading weights:" > "logs/lg4_${SLURM_JOB_ID:-manual}.log")

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import inspect
+import io
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,11 +13,73 @@ from transformers import AutoProcessor, Llama4ForConditionalGeneration
 
 
 @dataclass(frozen=True)
-class ModerationResult:
+class LG4ModerationResult:
     verdict: str                 # "safe" | "unsafe" | "unknown"
     categories: List[str]        # e.g. ["S9", "S2"]
     raw: str                     # raw decoded model output
     model: str
+
+
+def _extract_images(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Any]]:
+    """
+    Walk the message list and pull out image content blocks.
+
+    Accepted block formats (in the JSON payload):
+      {"type": "image", "url": "https://..."}           – public URL
+      {"type": "image", "data": "<base64>",
+       "media_type": "image/jpeg"}                      – base64-encoded bytes
+
+    Each image block is replaced with the bare {"type": "image"} sentinel
+    that Llama 4's processor expects, and the decoded PIL.Image is appended
+    to the returned images list (in document order).
+    """
+    try:
+        from PIL import Image
+        import requests as _req
+    except ImportError as e:
+        raise RuntimeError("Pillow and requests are required for image moderation") from e
+
+    cleaned: List[Dict[str, Any]] = []
+    images: List[Any] = []
+
+    for msg in messages:
+        new_content: List[Dict[str, Any]] = []
+        for block in msg.get("content", []):
+            if block.get("type") != "image":
+                new_content.append(block)
+                continue
+
+            # Resolve the image to a PIL Image object
+            if "data" in block:
+                # base64-encoded bytes
+                raw = base64.b64decode(block["data"])
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+            elif "url" in block:
+                url = block["url"]
+                if url.startswith("data:"):
+                    # data URI: data:image/jpeg;base64,<data>
+                    header, b64 = url.split(",", 1)
+                    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+                else:
+                    resp = _req.get(
+                        url,
+                        timeout=30,
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; llm-moderation/1.0)"},
+                    )
+                    resp.raise_for_status()
+                    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            else:
+                raise ValueError(f"Image block missing 'data' or 'url': {block}")
+
+            images.append(img)
+            # Replace with the bare sentinel the processor expects
+            new_content.append({"type": "image"})
+
+        cleaned.append({**msg, "content": new_content})
+
+    return cleaned, images
 
 
 def _parse_llamaguard_text(text: str) -> Tuple[str, List[str]]:
@@ -72,7 +136,7 @@ def _resolve_model_path(model_id: str) -> Tuple[str, bool]:
     return str(maybe_path), True
 
 
-class ModelRunner:
+class LG4ModelRunner:
     """
     Loads Llama Guard 4 once and provides a 'moderate' function.
     """
@@ -140,30 +204,44 @@ class ModelRunner:
         excluded_category_keys: Optional[List[str]] = None,
         max_new_tokens: int = 10,
         do_sample: bool = False,
-    ) -> ModerationResult:
+    ) -> LG4ModerationResult:
         """
         messages must match the HF blog structure, e.g.
         [{"role":"user","content":[{"type":"text","text":"..."}]}]
+
+        Image blocks are supported inside content:
+          {"type": "image", "url": "https://..."}          – public URL
+          {"type": "image", "data": "<base64>",
+           "media_type": "image/jpeg"}                     – base64-encoded
         """
         excluded_category_keys = excluded_category_keys or []
 
-        # Apply template -> tokenized tensors
-        # Some processor versions take positional `conversation` and may not accept excluded_category_keys.
-        apply_kwargs: Dict[str, Any] = {
-            "tokenize": True,
+        # Decode image blocks and replace with bare {"type":"image"} sentinels
+        messages, images = _extract_images(messages)
+
+        # Step 1: render the chat template to a plain text string (no tokenization yet).
+        # apply_chat_template does NOT accept images= — images are passed to the
+        # processor call in step 2.
+        template_kwargs: Dict[str, Any] = {
+            "tokenize": False,
             "add_generation_prompt": True,
-            "return_tensors": "pt",
-            "return_dict": True,
         }
         if "excluded_category_keys" in inspect.signature(self.processor.apply_chat_template).parameters:
-            apply_kwargs["excluded_category_keys"] = excluded_category_keys
+            template_kwargs["excluded_category_keys"] = excluded_category_keys
 
         try:
-            inputs = self.processor.apply_chat_template(messages, **apply_kwargs)
+            prompt_text: str = self.processor.apply_chat_template(messages, **template_kwargs)
         except TypeError:
-            # Fallback for older signature; drop excluded_category_keys if unsupported
-            apply_kwargs.pop("excluded_category_keys", None)
-            inputs = self.processor.apply_chat_template(messages, **apply_kwargs)
+            template_kwargs.pop("excluded_category_keys", None)
+            prompt_text = self.processor.apply_chat_template(messages, **template_kwargs)
+
+        # Step 2: tokenize — pass images here so the processor can insert pixel values.
+        proc_kwargs: Dict[str, Any] = {
+            "return_tensors": "pt",
+        }
+        if images:
+            proc_kwargs["images"] = images
+        inputs = self.processor(text=prompt_text, **proc_kwargs)
 
         # Move inputs to the same device as the model (device_map may shard,
         # but input tensors should go to the first parameter's device).
@@ -187,7 +265,7 @@ class ModelRunner:
         decoded = self.processor.decode(generated_tokens, skip_special_tokens=True)
 
         verdict, categories = _parse_llamaguard_text(decoded)
-        return ModerationResult(
+        return LG4ModerationResult(
             verdict=verdict,
             categories=categories,
             raw=decoded.strip(),
