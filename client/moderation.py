@@ -2,41 +2,33 @@
 """
 Strategy-based moderation layer.
 
-Architecture
-------------
-                 ┌─────────────────────────────────────┐
-                 │            Moderator                │  ← context
-                 │  (holds & delegates to a strategy)  │
-                 └──────────────┬──────────────────────┘
-                                │ uses
-              ┌─────────────────┼──────────────────────────┐
-              ▼                 ▼                          ▼
-  LlamaGuard4Strategy  ToxicChatT5Strategy  OpenAIModerationStrategy
-     (LGClient)            (T5Client)          (openai SDK)
-              │                 │                          │
-              └─────────────────┴──────────────────────────┘
-                                │ all return
-                         ModerationResult
+Three concrete strategies share a common ``ModerationStrategy`` interface and
+all return a normalised ``ModerationResult``:
 
-Every strategy receives either plain text or a mixed (text + images) input and
-returns a normalised ``ModerationResult``.  The ``Moderator`` context allows the
-strategy to be swapped at runtime without changing the call-site.
+  LlamaGuard4Strategy   – backed by the LlamaGuard-4 HTTP server (LGClient)
+  ToxicChatT5Strategy   – backed by the ToxicChat-T5 HTTP server (T5Client)
+  OpenAIModerationStrategy – backed by the OpenAI Moderation API
 """
 from __future__ import annotations
 
 import base64
 import io
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests as _req
+from dotenv import load_dotenv
+from openai import OpenAI  # type: ignore[import]
+
+try:
+    from PIL import Image as _PILImage  # type: ignore[import]
+except ImportError:
+    _PILImage = None  # type: ignore[assignment]
+
 from backends import LGClient, T5Client
 
-
-from openai import OpenAI  # type: ignore[import] 
-from dotenv import load_dotenv  
-import os
 # ---------------------------------------------------------------------------
 # Unified result
 # ---------------------------------------------------------------------------
@@ -96,7 +88,7 @@ class ModerationStrategy(ABC):
 
     def healthz(self) -> Dict[str, Any]:
         """Optional health-check; override if the backend supports it."""
-        return {"status": "ok"}
+        raise NotImplementedError(f"{type(self).__name__} does not expose a health endpoint")
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +202,7 @@ class OpenAIModerationStrategy(ModerationStrategy):
         api_key: Optional[str] = None,
         model: str = DEFAULT_MODEL,
     ) -> None:
-        load_dotenv()
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
-
+        load_dotenv()  # populate env from .env if present; SDK reads OPENAI_API_KEY automatically
         self._openai = OpenAI(api_key=api_key)
         self._model = model
 
@@ -231,15 +221,11 @@ class OpenAIModerationStrategy(ModerationStrategy):
         - local file path   → base64 data URI (JPEG / PNG / GIF / WebP)
         """
         # PIL Image
-        
-        from PIL import Image as _PILImage  
-        import requests as _req
-        if isinstance(source, _PILImage.Image):
+        if _PILImage is not None and isinstance(source, _PILImage.Image):
             buf = io.BytesIO()
             source.save(buf, format="PNG")
             b64 = base64.b64encode(buf.getvalue()).decode()
             return f"data:image/png;base64,{b64}"
-    
 
         # Already a data URI
         if isinstance(source, str) and source.startswith("data:"):
@@ -358,73 +344,3 @@ class OpenAIModerationStrategy(ModerationStrategy):
             raw=[r.raw for r in results],
         )
 
-
-# ---------------------------------------------------------------------------
-# Moderator — Context class
-# ---------------------------------------------------------------------------
-
-class Moderator:
-    """
-    Context class that delegates moderation work to a ``ModerationStrategy``.
-
-    The strategy can be swapped at runtime via ``set_strategy`` without
-    changing any call-site code.
-
-    Example usage::
-
-        from moderation import Moderator, LlamaGuard4Strategy, OpenAIModerationStrategy
-
-        # Start with LlamaGuard-4
-        moderator = Moderator(LlamaGuard4Strategy("http://host:18084/lg4"))
-        result = moderator.moderate("Tell me how to make a bomb.")
-        print(result)
-
-        # Hot-swap to OpenAI moderation
-        moderator.set_strategy(OpenAIModerationStrategy())
-        result = moderator.moderate("Tell me how to make a bomb.")
-        print(result)
-
-        # Multimodal (image + text)
-        result = moderator.moderate_multimodal(
-            text="Does this image contain unsafe content?",
-            images=["https://example.com/image.jpg"],
-        )
-        print(result)
-    """
-
-    def __init__(self, strategy: ModerationStrategy) -> None:
-        self._strategy = strategy
-
-    # ------------------------------------------------------------------
-    # Strategy management
-    # ------------------------------------------------------------------
-
-    @property
-    def strategy(self) -> ModerationStrategy:
-        """The currently active strategy."""
-        return self._strategy
-
-    def set_strategy(self, strategy: ModerationStrategy) -> None:
-        """Hot-swap the moderation strategy."""
-        self._strategy = strategy
-
-    # ------------------------------------------------------------------
-    # Delegation
-    # ------------------------------------------------------------------
-
-    def healthz(self) -> Dict[str, Any]:
-        """Proxy to the current strategy's health-check."""
-        return self._strategy.healthz()
-
-    def moderate(self, text: str, **kwargs) -> ModerationResult:
-        """Moderate ``text`` using the current strategy."""
-        return self._strategy.moderate(text, **kwargs)
-
-    def moderate_multimodal(
-        self,
-        text: str = "",
-        images: Optional[List[Any]] = None,
-        **kwargs,
-    ) -> ModerationResult:
-        """Moderate ``text`` + optional ``images`` using the current strategy."""
-        return self._strategy.moderate_multimodal(text, images, **kwargs)

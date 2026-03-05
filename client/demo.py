@@ -1,13 +1,8 @@
 # client/demo.py
 from __future__ import annotations
 
-from moderation import (
-    LlamaGuard4Strategy,
-    Moderator,
-    ModerationResult,
-    OpenAIModerationStrategy,
-    ToxicChatT5Strategy,
-)
+from moderation import (LlamaGuard4Strategy, ModerationResult,
+                        OpenAIModerationStrategy, ToxicChatT5Strategy)
 from rich import print
 from rich.pretty import Pretty
 
@@ -95,42 +90,42 @@ def _print_result(result: ModerationResult, source: str | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Demo runners — all use Moderator as the sole client interface
+# Demo runners
 # ---------------------------------------------------------------------------
 
 def run_llamaguard(texts: list[str], node_ip: str = NODE_IP) -> None:
     """LlamaGuard-4 text moderation."""
-    moderator = Moderator(LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4"))
+    strategy = LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4")
 
     print("\n[bold cyan]═══ LlamaGuard-4 ═══[/bold cyan]")
-    print("[bold]healthz:[/bold]", Pretty(moderator.healthz(), expand_all=True))
+    print("[bold]healthz:[/bold]", Pretty(strategy.healthz(), expand_all=True))
 
     for text in texts:
         print(f"\n[yellow]▶ {text!r}[/yellow]")
-        _print_result(moderator.moderate(text))
+        _print_result(strategy.moderate(text))
 
 
 def run_toxicchat_t5(texts: list[str], node_ip: str = NODE_IP) -> None:
     """ToxicChat-T5 text moderation."""
-    moderator = Moderator(ToxicChatT5Strategy(f"http://{node_ip}:18084/t5"))
+    strategy = ToxicChatT5Strategy(f"http://{node_ip}:18084/t5")
 
     print("\n[bold cyan]═══ ToxicChat-T5 ═══[/bold cyan]")
-    print("[bold]healthz:[/bold]", Pretty(moderator.healthz(), expand_all=True))
+    print("[bold]healthz:[/bold]", Pretty(strategy.healthz(), expand_all=True))
 
     for text in texts:
         print(f"\n[yellow]▶ {text!r}[/yellow]")
-        _print_result(moderator.moderate(text))
+        _print_result(strategy.moderate(text))
 
 
 def run_openai(texts: list[str], api_key: str | None = None) -> None:
     """OpenAI moderation API — text."""
-    moderator = Moderator(OpenAIModerationStrategy(api_key=api_key))
+    strategy = OpenAIModerationStrategy(api_key=api_key)
 
     print("\n[bold cyan]═══ OpenAI Moderation ═══[/bold cyan]")
 
     for text in texts:
         print(f"\n[yellow]▶ {text!r}[/yellow]")
-        _print_result(moderator.moderate(text))
+        _print_result(strategy.moderate(text))
 
 
 def run_openai_multimodal(
@@ -143,17 +138,17 @@ def run_openai_multimodal(
     Each image is moderated independently.  If texts is provided, each image
     is also paired with each text in a separate call.
     """
-    moderator = Moderator(OpenAIModerationStrategy(api_key=api_key))
+    strategy = OpenAIModerationStrategy(api_key=api_key)
 
     print("\n[bold cyan]═══ OpenAI Moderation — multimodal ═══[/bold cyan]")
     for img in images:
         if texts:
             for text in texts:
                 print(f"\n[yellow]▶ {text!r}[/yellow]")
-                _print_result(moderator.moderate_multimodal(text=text, images=[img]), source=img)
+                _print_result(strategy.moderate_multimodal(text=text, images=[img]), source=img)
         else:
             print()
-            _print_result(moderator.moderate_multimodal(images=[img]), source=img)
+            _print_result(strategy.moderate_multimodal(images=[img]), source=img)
 
 
 def run_llamaguard_multimodal(
@@ -166,43 +161,41 @@ def run_llamaguard_multimodal(
     Each image is moderated independently.  If texts is provided, each image
     is also paired with each text in a separate call.
     """
-    moderator = Moderator(LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4"))
+    strategy = LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4")
 
     print("\n[bold cyan]═══ LlamaGuard-4 — multimodal ═══[/bold cyan]")
     for img in images:
         if texts:
             for text in texts:
                 print(f"\n[yellow]▶ {text!r}[/yellow]")
-                _print_result(moderator.moderate_multimodal(text=text, images=[img]), source=img)
+                _print_result(strategy.moderate_multimodal(text=text, images=[img]), source=img)
         else:
             print()
-            _print_result(moderator.moderate_multimodal(images=[img]), source=img)
+            _print_result(strategy.moderate_multimodal(images=[img]), source=img)
 
 
 def run_side_by_side(texts: list[str], node_ip: str = NODE_IP) -> None:
     """Run the same prompts through all backends side-by-side."""
     backends = {
-        "LlamaGuard-4": Moderator(LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4")),
-        "ToxicChat-T5": Moderator(ToxicChatT5Strategy(f"http://{node_ip}:18084/t5")),
-        "OpenAI":       Moderator(OpenAIModerationStrategy()),
+        "LlamaGuard-4": LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4"),
+        "ToxicChat-T5": ToxicChatT5Strategy(f"http://{node_ip}:18084/t5"),
+        "OpenAI":       OpenAIModerationStrategy(),
     }
 
     print("\n[bold cyan]═══ Side-by-side comparison ═══[/bold cyan]")
     for text in texts:
         print(f"\n[yellow]{'=' * 60}[/yellow]")
         print(f"[yellow]▶ {text!r}[/yellow]")
-        for name, moderator in backends.items():
-            result = moderator.moderate(text)
+        for name, strategy in backends.items():
+            result = strategy.moderate(text)
             flag = "[bold red]✗[/bold red]" if result.flagged else "[bold green]✓[/bold green]"
             cats = _fmt_categories(result.categories)
             print(f"  {flag} [bold]{name:<14}[/bold] {result.verdict:<8}  {cats}")
 
 
 def run_hot_swap(texts: list[str], node_ip: str = NODE_IP) -> None:
-    """Demonstrate hot-swapping the strategy on a single Moderator instance."""
-    print("\n[bold cyan]═══ Hot-swap demo ═══[/bold cyan]")
-
-    moderator = Moderator(LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4"))
+    """Run the same prompts through all backends in sequence."""
+    print("\n[bold cyan]═══ Sequential backends demo ═══[/bold cyan]")
 
     for name, strategy in [
         ("LlamaGuard-4", LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4")),
@@ -210,10 +203,9 @@ def run_hot_swap(texts: list[str], node_ip: str = NODE_IP) -> None:
         ("OpenAI",       OpenAIModerationStrategy()),
     ]:
         print(f"\n[bold magenta]── {name} ──[/bold magenta]")
-        moderator.set_strategy(strategy)
         for text in texts:
             print(f"  [yellow]{text!r}[/yellow]")
-            _print_result(moderator.moderate(text))
+            _print_result(strategy.moderate(text))
 
 
 def run_side_by_side_multimodal(
@@ -227,8 +219,8 @@ def run_side_by_side_multimodal(
     is also paired with each text.
     """
     backends = {
-        "LlamaGuard-4": Moderator(LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4")),
-        "OpenAI":       Moderator(OpenAIModerationStrategy()),
+        "LlamaGuard-4": LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4"),
+        "OpenAI":       OpenAIModerationStrategy(),
     }
 
     print("\n[bold cyan]═══ Side-by-side multimodal comparison ═══[/bold cyan]")
@@ -239,8 +231,8 @@ def run_side_by_side_multimodal(
             print(f"[yellow]▶ image: {img}[/yellow]")
             if text:
                 print(f"[yellow]▶ text : {text!r}[/yellow]")
-            for name, moderator in backends.items():
-                result = moderator.moderate_multimodal(text, images=[img])
+            for name, strategy in backends.items():
+                result = strategy.moderate_multimodal(text, images=[img])
                 flag = "[bold red]✗[/bold red]" if result.flagged else "[bold green]✓[/bold green]"
                 cats = _fmt_categories(result.categories)
                 print(f"  {flag} [bold]{name:<14}[/bold] {result.verdict:<8}  {cats}")
@@ -251,13 +243,12 @@ def run_hot_swap_multimodal(
     texts: list[str] | None = None,
     node_ip: str = NODE_IP,
 ) -> None:
-    """Hot-swap multimodal-capable strategies on a single Moderator (T5 skipped).
+    """Run multimodal-capable backends in sequence (T5 skipped).
 
     Each image is moderated independently.  If texts is provided, each image
     is also paired with each text.
     """
-    print("\n[bold cyan]═══ Hot-swap multimodal demo ═══[/bold cyan]")
-    moderator = Moderator(LlamaGuard4Strategy(f"http://{node_ip}:18084/lg4"))
+    print("\n[bold cyan]═══ Sequential multimodal backends demo ═══[/bold cyan]")
     prompts: list[str] = texts if texts else [""]
 
     for name, strategy in [
@@ -265,12 +256,11 @@ def run_hot_swap_multimodal(
         ("OpenAI",       OpenAIModerationStrategy()),
     ]:
         print(f"\n[bold magenta]── {name} ──[/bold magenta]")
-        moderator.set_strategy(strategy)
         for img in images:
             for text in prompts:
                 if text:
                     print(f"  [yellow]▶ text: {text!r}[/yellow]")
-                _print_result(moderator.moderate_multimodal(text, images=[img]), source=img)
+                _print_result(strategy.moderate_multimodal(text, images=[img]), source=img)
 
 
 # ---------------------------------------------------------------------------

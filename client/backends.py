@@ -1,10 +1,18 @@
 # client/backends.py
 from __future__ import annotations
 
+import base64
+import io
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+
+try:
+    from PIL import Image as _PILImage  # type: ignore[import]
+except ImportError:
+    _PILImage = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -40,30 +48,22 @@ class LGClient:
           str       -> http(s) URL  => {"type":"image","url":"..."}   (server fetches)
           PIL Image                 => base64-encoded PNG
         """
-        import base64
-        import io
-        from pathlib import Path as _Path
-
         # PIL Image
-        try:
-            from PIL import Image as _PILImage
-            if isinstance(source, _PILImage.Image):
-                buf = io.BytesIO()
-                source.save(buf, format="PNG")
-                return {
-                    "type": "image",
-                    "data": base64.b64encode(buf.getvalue()).decode(),
-                    "media_type": "image/png",
-                }
-        except ImportError:
-            pass
+        if _PILImage is not None and isinstance(source, _PILImage.Image):
+            buf = io.BytesIO()
+            source.save(buf, format="PNG")
+            return {
+                "type": "image",
+                "data": base64.b64encode(buf.getvalue()).decode(),
+                "media_type": "image/png",
+            }
 
         # URL string
         if isinstance(source, str) and source.startswith(("http://", "https://", "data:")):
             return {"type": "image", "url": source}
 
         # Local file path (str or Path)
-        path = _Path(source)
+        path = Path(source)
         suffix = path.suffix.lower()
         media_type = {
             ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
